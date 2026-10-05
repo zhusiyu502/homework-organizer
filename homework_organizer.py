@@ -20,6 +20,12 @@ homework_organizer.py
     4. 复用需求1的 collect_files() 扫描逻辑，不重复写扫描代码
     5. 真正执行前给出警告并二次确认
 
+PR2 增强：
+    6. 归档结束（含 dry-run）后，输出各分类文件数量汇总，便于核对结果
+    7. 支持与 --ext 组合，只归档指定后缀的文件
+    8. 同名文件自动追加序号，绝不覆盖已有文件
+    9. 提供标准库 unittest 单元测试（test_homework_organizer.py）
+
 需求3：批量改名（--rename）
     1. 改名规则：把「学号_姓名_作业名.ext」改为「作业名_学号.ext」
        例如：20230001_张三_数学作业.pdf -> 数学作业_20230001.pdf
@@ -50,16 +56,22 @@ homework_organizer.py
     # 5) 确认无误后真正执行归档（执行前会二次确认）
     python homework_organizer.py "D:\\作业" --organize
 
-    # 6) 批量改名：先打印“旧名 -> 新名”预览，按提示输入 y 才真正执行
+    # 6) 只归档指定后缀（与 --ext 组合使用）
+    python homework_organizer.py "D:\\作业" --organize -e pdf,docx --dry-run
+
+    # 7) 批量改名：先打印“旧名 -> 新名”预览，按提示输入 y 才真正执行
     python homework_organizer.py "D:\\作业" --rename
 
-    # 7) 仅查看改名预览，不执行改名
+    # 8) 仅查看改名预览，不执行改名
     python homework_organizer.py "D:\\作业" --rename --dry-run
 
-    # 8) 只对指定后缀的文件改名
+    # 9) 只对指定后缀的文件改名
     python homework_organizer.py "D:\\作业" --rename -e pdf
 
-    # 9) 查看帮助
+    # 10) 运行单元测试（标准库 unittest，无需第三方依赖）
+    python -m unittest -v
+
+    # 11) 查看帮助
     python homework_organizer.py -h
 --------------------------------------------------------------------------
 """
@@ -82,6 +94,8 @@ CATEGORY_RULES = {
 }
 # 未命中任何规则的后缀统一归入此分类
 DEFAULT_CATEGORY = "其他"
+# 汇总输出时使用的固定分类顺序（图片 -> 文档 -> 视频 -> 其他）
+CATEGORY_ORDER = list(CATEGORY_RULES.keys()) + [DEFAULT_CATEGORY]
 
 
 def parse_extensions(raw: str):
@@ -269,6 +283,28 @@ def build_unique_path(dest_dir: str, filename: str) -> str:
     return candidate
 
 
+def format_category_summary(category_counts: dict) -> str:
+    """
+    【PR2 增强】将各分类的文件数量格式化为多行文本。
+
+    参数:
+        category_counts: {分类名: 数量} 的字典。
+
+    返回:
+        形如 "  图片：2 个\n  文档：3 个" 的文本（按固定分类顺序排列）。
+    """
+    lines = []
+    # 先按预设顺序输出已知分类，保证每次运行展示顺序一致
+    for category in CATEGORY_ORDER:
+        if category in category_counts:
+            lines.append(f"  {category}：{category_counts[category]} 个")
+    # 兜底：万一出现顺序表之外的分类，追加展示，避免遗漏
+    for category, count in category_counts.items():
+        if category not in CATEGORY_ORDER:
+            lines.append(f"  {category}：{count} 个")
+    return "\n".join(lines)
+
+
 def organize_files(target_dir: str, files, dry_run: bool = False) -> int:
     """
     将 files 中的文件按类型移动到对应分类文件夹。
@@ -283,6 +319,7 @@ def organize_files(target_dir: str, files, dry_run: bool = False) -> int:
     """
     # 第一步：先把移动计划计算出来（只读，不改动磁盘）
     plan = []  # 每项为 (分类, 源路径, 目标路径)
+    category_counts = {}  # 【PR2 增强】统计每个分类包含的文件数量
     for item in files:
         name = item["name"]
         category = classify_file(name)
@@ -290,6 +327,7 @@ def organize_files(target_dir: str, files, dry_run: bool = False) -> int:
         dest_dir = os.path.join(target_dir, category)
         dst = build_unique_path(dest_dir, name)
         plan.append((category, src, dst))
+        category_counts[category] = category_counts.get(category, 0) + 1
 
     if not plan:
         print("没有需要归档的文件。")
@@ -338,6 +376,11 @@ def organize_files(target_dir: str, files, dry_run: bool = False) -> int:
     else:
         print(f"归档完成：成功 {moved} 个"
               + (f"，失败 {failed} 个" if failed else ""))
+
+    # 【PR2 增强】输出各分类数量汇总，方便快速核对归档结果
+    if category_counts:
+        print("分类汇总：")
+        print(format_category_summary(category_counts))
 
     return 0 if failed == 0 else 1
 
