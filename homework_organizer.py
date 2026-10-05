@@ -20,6 +20,15 @@ homework_organizer.py
     4. 复用需求1的 collect_files() 扫描逻辑，不重复写扫描代码
     5. 真正执行前给出警告并二次确认
 
+需求3：批量改名（--rename）
+    1. 改名规则：把「学号_姓名_作业名.ext」改为「作业名_学号.ext」
+       例如：20230001_张三_数学作业.pdf -> 数学作业_20230001.pdf
+    2. 强制流程：先打印全部“旧名 -> 新名”预览，用户输入 y 后才执行真实改名
+    3. 目标文件名已存在时直接跳过，禁止覆盖原有文件，并给出提示
+    4. 复用需求1的 collect_files() 扫描逻辑，不重复写扫描代码
+    5. 可与 --ext 组合，只对指定后缀的文件改名
+    6. --dry-run 可只看改名预览而不执行
+
 仅依赖 Python 标准库，兼容 Windows。
 
 --------------------------------------------------------------------------
@@ -41,7 +50,16 @@ homework_organizer.py
     # 5) 确认无误后真正执行归档（执行前会二次确认）
     python homework_organizer.py "D:\\作业" --organize
 
-    # 6) 查看帮助
+    # 6) 批量改名：先打印“旧名 -> 新名”预览，按提示输入 y 才真正执行
+    python homework_organizer.py "D:\\作业" --rename
+
+    # 7) 仅查看改名预览，不执行改名
+    python homework_organizer.py "D:\\作业" --rename --dry-run
+
+    # 8) 只对指定后缀的文件改名
+    python homework_organizer.py "D:\\作业" --rename -e pdf
+
+    # 9) 查看帮助
     python homework_organizer.py -h
 --------------------------------------------------------------------------
 """
@@ -324,13 +342,162 @@ def organize_files(target_dir: str, files, dry_run: bool = False) -> int:
     return 0 if failed == 0 else 1
 
 
+# ---------------------------------------------------------------------------
+# 需求3：批量改名
+# ---------------------------------------------------------------------------
+# 改名规则：原始格式「学号_姓名_作业名.ext」 -> 目标格式「作业名_学号.ext」
+# 例如：20230001_张三_数学作业.pdf -> 数学作业_20230001.pdf
+RENAME_SEPARATOR = "_"
+
+
+def build_renamed_name(filename: str):
+    """
+    根据改名规则计算新文件名。
+
+    规则（以下划线分段）：
+        学号   = 第 1 段
+        姓名   = 第 2 段（改名后丢弃）
+        作业名 = 第 3 段及之后的所有段（保留作业名中可能包含的下划线）
+
+    参数:
+        filename: 原始文件名，例如 "20230001_张三_数学作业.pdf"。
+
+    返回:
+        新文件名；若分段不足 3 段（不符合规则）则返回 None。
+    """
+    base, ext = os.path.splitext(filename)
+    parts = base.split(RENAME_SEPARATOR)
+
+    # 必须至少有 学号 / 姓名 / 作业名 三段，否则不处理
+    if len(parts) < 3:
+        return None
+
+    student_id = parts[0]
+    homework = RENAME_SEPARATOR.join(parts[2:])
+    new_base = f"{homework}{RENAME_SEPARATOR}{student_id}"
+    return new_base + ext
+
+
+def plan_renames(files):
+    """
+    根据 collect_files() 的结果计算改名计划（只读，不改动磁盘）。
+
+    冲突处理（禁止覆盖）：
+        - 目标文件名与当前目录已有文件重名（大小写不敏感）-> 跳过
+        - 多个源文件会改成同一个目标名 -> 只保留第一个，其余跳过
+        - 新名称与原名称相同 -> 跳过
+
+    参数:
+        files: collect_files() 返回的列表，每项含 name 字段。
+
+    返回:
+        (renames, skipped)
+            renames: list[tuple[str, str]]，元素为 (旧名, 新名)
+            skipped: list[tuple[str, str]]，元素为 (文件名, 跳过原因)
+    """
+    # 已占用的文件名集合；normcase 使比较在 Windows 上大小写不敏感
+    occupied = {os.path.normcase(f["name"]) for f in files}
+    renames = []
+    skipped = []
+
+    for item in files:
+        old = item["name"]
+        new = build_renamed_name(old)
+
+        if new is None:
+            skipped.append((old, "不符合改名规则（需 学号_姓名_作业名.ext）"))
+            continue
+        if os.path.normcase(new) == os.path.normcase(old):
+            skipped.append((old, "新名称与原名称相同"))
+            continue
+        # 目标名已被占用 -> 跳过，绝不覆盖
+        if os.path.normcase(new) in occupied:
+            skipped.append((old, f"目标文件名已存在，已跳过（不覆盖）：{new}"))
+            continue
+
+        renames.append((old, new))
+        # 将新名称也标记为已占用，避免本次计划内两个文件改到同一目标名
+        occupied.add(os.path.normcase(new))
+
+    return renames, skipped
+
+
+def print_rename_preview(target_dir: str, renames, skipped):
+    """
+    打印全部改名的“旧名 -> 新名”预览，以及被跳过的文件。
+
+    本函数只读不写，不会修改任何文件。
+
+    参数:
+        target_dir: 目标文件夹（仅用于显示）。
+        renames: 待改名列表 (旧名, 新名)。
+        skipped: 被跳过的文件及原因。
+    """
+    print(f"改名目录：{os.path.abspath(target_dir)}")
+    print(f"=== 改名预览（共 {len(renames)} 个文件将被重命名）===")
+
+    if renames:
+        # 计算列宽，保证预览对齐
+        old_w = max(len("原文件名"), max(len(o) for o, _ in renames))
+        new_w = max(len("新文件名"), max(len(n) for _, n in renames))
+        print(f"{'原文件名':<{old_w}} -> {'新文件名':<{new_w}}")
+        print("-" * (old_w + new_w + 4))
+        for old, new in renames:
+            print(f"{old:<{old_w}} -> {new:<{new_w}}")
+    else:
+        print("（没有可改名的文件）")
+
+    if skipped:
+        print(f"--- 已跳过 {len(skipped)} 个文件 ---")
+        for name, reason in skipped:
+            print(f"  [跳过] {name}：{reason}")
+
+
+def apply_renames(target_dir: str, renames) -> int:
+    """
+    执行真正的改名操作（只在用户确认后调用，绝不覆盖已有文件）。
+
+    参数:
+        target_dir: 目标文件夹。
+        renames: plan_renames() 得到的改名计划。
+
+    返回:
+        0 表示全部成功，1 表示存在跳过/失败项。
+    """
+    print("=== 开始改名 ===")
+    ok = 0
+    failed = 0
+
+    for old, new in renames:
+        src = os.path.join(target_dir, old)
+        dst = os.path.join(target_dir, new)
+
+        # 执行前再检查一次目标是否存在（双保险，防止预览到执行期间产生的新文件被覆盖）
+        if os.path.exists(dst):
+            print(f"[跳过] {old} -> {new}：目标已存在，不覆盖", file=sys.stderr)
+            failed += 1
+            continue
+
+        try:
+            os.rename(src, dst)
+            print(f"[OK] {old} -> {new}")
+            ok += 1
+        except OSError as exc:
+            print(f"[失败] {old} -> {new}：{exc}", file=sys.stderr)
+            failed += 1
+
+    print(f"改名完成：成功 {ok} 个" + (f"，跳过/失败 {failed} 个" if failed else ""))
+    return 0 if failed == 0 else 1
+
+
 def build_arg_parser():
     """构建命令行参数解析器（使用 argparse）。"""
     parser = argparse.ArgumentParser(
         prog="homework_organizer.py",
-        description="扫描并列出指定文件夹内的文件（不递归子文件夹）；支持按类型自动归档。",
+        description="扫描并列出指定文件夹内的文件（不递归子文件夹）；支持按类型自动归档、批量改名。",
         epilog="示例：python homework_organizer.py . --ext .docx,.pdf  |  "
-               "python homework_organizer.py . --organize --dry-run",
+               "python homework_organizer.py . --organize --dry-run  |  "
+               "python homework_organizer.py . --rename",
     )
     # 位置参数：目标文件夹路径
     parser.add_argument(
@@ -355,7 +522,13 @@ def build_arg_parser():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="配合 --organize 使用：只模拟并打印移动操作，不真正移动文件",
+        help="配合 --organize 或 --rename 使用：只预览操作，不真正改动文件",
+    )
+    # 可选参数：批量改名（需求3）
+    parser.add_argument(
+        "--rename",
+        action="store_true",
+        help="批量改名模式：把 学号_姓名_作业名.ext 改为 作业名_学号.ext（执行前预览并二次确认）",
     )
     return parser
 
@@ -364,6 +537,11 @@ def main(argv=None):
     """程序入口：解析参数 -> 校验目录 -> 收集文件 -> 列出或归档。"""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    # --organize 与 --rename 是两种互斥的操作，不能同时使用
+    if args.organize and args.rename:
+        print("错误：--organize 与 --rename 不能同时使用。", file=sys.stderr)
+        return 1
 
     target_dir = args.folder
 
@@ -376,8 +554,8 @@ def main(argv=None):
         return 1
 
     # --dry-run 单独使用没有意义，给出提示（不视为错误）
-    if args.dry_run and not args.organize:
-        print("提示：--dry-run 需与 --organize 一起使用才有效。")
+    if args.dry_run and not (args.organize or args.rename):
+        print("提示：--dry-run 需与 --organize 或 --rename 一起使用才有效。")
 
     exts = parse_extensions(args.ext)
 
@@ -390,6 +568,36 @@ def main(argv=None):
     except OSError as exc:
         print(f"错误：读取文件夹失败 -> {exc}", file=sys.stderr)
         return 1
+
+    # ---- 需求3：批量改名 ----
+    if args.rename:
+        # 先计算改名计划（只读，不改动磁盘）
+        renames, skipped = plan_renames(files)
+        # 强制要求：先打印全部“旧名 -> 新名”预览
+        print_rename_preview(target_dir, renames, skipped)
+
+        if not renames:
+            print("没有需要改名的文件，未做任何改动。")
+            return 0
+
+        # --dry-run：只看预览，不执行
+        if args.dry_run:
+            print("（--dry-run）仅预览改名结果，未做任何改动。")
+            return 0
+
+        # 强制二次确认：必须输入 y 才执行真实改名
+        try:
+            answer = input(
+                "确认执行以上改名？输入 y 后回车执行，其他任意内容取消："
+            ).strip().lower()
+        except EOFError:
+            print("无法读取确认输入，已取消，未做任何改动。")
+            return 1
+        if answer not in ("y", "yes"):
+            print("已取消，未做任何改动。")
+            return 0
+
+        return apply_renames(target_dir, renames)
 
     # ---- 需求2：归档模式 ----
     if args.organize:
